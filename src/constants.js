@@ -1,1 +1,1 @@
-export const DB_NAME = "Aerosense";   
+export const DB_NAME = "AeroSense";   
