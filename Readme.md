@@ -1,5 +1,4 @@
 # AeroSense Server
-[![Ask DeepWiki](https://devin.ai/assets/askdeepwiki.png)](https://deepwiki.com/onlySaish/AeroSense-Server)
 
 This repository contains the backend server for the AeroSense application. It's built with Node.js and Express, providing a robust RESTful API for user management, authentication, and other core functionalities.
 
