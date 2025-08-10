@@ -1,0 +1,266 @@
+import axios from "axios";
+import { ApiError } from "../utils/ApiError.js";
+import { ApiResponse } from "../utils/ApiResponse.js";
+import { asyncHandler } from "../utils/asyncHandler.js";
+import { writeDataToCSV } from "../utils/csvWriter.js";
+import { OPENAQ_API_KEY, BASE_LOCATIONS } from "../constants.js";
+
+const BASE_MEASUREMENTS = "https://api.openaq.org/v3/measurements";
+const SENSOR_API = (sensorId) => `https://api.openaq.org/v3/sensors/${sensorId}`;
+
+// Molecular weights for standardization
+const MW = {
+  CO: 28.01,
+  NO2: 46.01,
+  O3: 48.0,
+  SO2: 64.07,
+  "PM2.5": 1,
+  PM10: 1,
+};
+
+// Convert to µg/m³
+function toUgPerM3(value, unit, param) {
+  if (value === undefined || value === null || !unit || !param) return null;
+  param = param.toUpperCase();
+  if (unit === "µg/m³" || unit === "ug/m3") return Number(value);
+  if (unit === "mg/m³" || unit === "mg/m3") return Number(value) * 1000;
+  if (unit === "ppm" && MW[param]) return Number(value) * MW[param] * 40.9;
+  if (unit === "ppb" && MW[param]) return Number(value) * MW[param] * 0.0409;
+  return null;
+}
+
+const createAirQualityData = asyncHandler(async (req, res) => {
+  const { lat, lon } = req.query;
+  if (!lat || !lon) throw new ApiError(400, "Latitude and Longitude are required.");
+
+  const sensorCache = new Map();
+  const allData = [];
+
+  // Get date range for past year
+  const dateTo = new Date();
+  const dateFrom = new Date();
+  // dateFrom.setFullYear(dateFrom.getFullYear() - 1);
+  dateFrom.setMonth(dateFrom.getMonth() - 1);
+
+  try {
+    // Step 1: Find nearby stations
+    const locRes = await axios.get(BASE_LOCATIONS, {
+      params: {
+        coordinates: `${lat},${lon}`,
+        radius: 5000,
+        limit: 5,
+      },
+      headers: { "X-API-Key": OPENAQ_API_KEY },
+    });
+
+    const locations = locRes.data.results;
+    if (!locations.length) {
+      return res.status(200).json(new ApiResponse(200, [], "No stations found nearby"));
+    }
+
+    // Step 2: For each location, fetch 1-year measurements
+    // await Promise.all(
+    //   locations.map(async (loc) => {
+    //     let page = 1;
+    //     let hasMore = true;
+    //     const pollutants = {};
+
+    //     while (hasMore) {
+    //       const measRes = await axios.get(BASE_MEASUREMENTS, {
+    //         params: {
+    //           location_id: loc.id,
+    //           date_from: dateFrom.toISOString().split("T")[0],
+    //           date_to: dateTo.toISOString().split("T")[0],
+    //           limit: 100,
+    //           page,
+    //           sort: "desc",
+    //         },
+    //         headers: { "X-API-Key": OPENAQ_API_KEY },
+    //       });
+
+    //       const measurements = measRes.data.results || [];
+    //       if (!measurements.length) {
+    //         hasMore = false;
+    //         break;
+    //       }
+
+    //       await Promise.all(
+    //         measurements.map(async (m) => {
+    //           const sensorId = m.sensorsId;
+    //           if (!sensorId) return;
+
+    //           let sensorInfo;
+    //           if (sensorCache.has(sensorId)) {
+    //             sensorInfo = sensorCache.get(sensorId);
+    //           } else {
+    //             try {
+    //               const sensorRes = await axios.get(SENSOR_API(sensorId), {
+    //                 headers: { "X-API-Key": OPENAQ_API_KEY },
+    //               });
+    //               sensorInfo = sensorRes.data?.results?.[0];
+    //               sensorCache.set(sensorId, sensorInfo);
+    //             } catch {
+    //               return;
+    //             }
+    //           }
+
+    //           const param = sensorInfo?.parameter?.name?.toUpperCase();
+    //           const unit = sensorInfo?.parameter?.units || m.unit || "";
+
+    //           if (param && m.value !== undefined) {
+    //             if (!pollutants[param]) pollutants[param] = [];
+
+    //             if (param === "TEMPERATURE" || param === "RELATIVEHUMIDITY") {
+    //               pollutants[param].push({
+    //                 value: Number(m.value),
+    //                 unit,
+    //                 date: m.date?.utc,
+    //               });
+    //             } else {
+    //               const ugValue = toUgPerM3(m.value, unit, param);
+    //               if (ugValue !== null) {
+    //                 pollutants[param].push({
+    //                   value: Number(ugValue.toFixed(2)),
+    //                   unit: "µg/m³",
+    //                   date: m.date?.utc,
+    //                 });
+    //               }
+    //             }
+    //           }
+    //         })
+    //       );
+
+    //       hasMore = measurements.length === 100;
+    //       page++;
+    //     }
+
+    //     allData.push({
+    //       location: loc.name,
+    //       coordinates: loc.coordinates,
+    //       pollutants,
+    //     });
+    //   })
+    // );
+    // Step 2: For each location, fetch available 1-year of measurements in the sensor's lifespan
+    await Promise.all(
+      locations.map(async (loc) => {
+        const pollutants = {};
+        const sensors = loc.sensors || [];
+        if (!sensors.length) return;
+      
+        for (const sensor of sensors) {
+          try {
+            // Get earliest measurement for this sensor
+            const earliestRes = await axios.get(BASE_MEASUREMENTS, {
+              params: {
+                sensorId: sensor.id,
+                limit: 1,
+                sort: "asc",
+              },
+              headers: { "X-API-Key": OPENAQ_API_KEY },
+            });
+          
+            const firstMeasurement = earliestRes.data.results?.[0];
+            if (!firstMeasurement) continue;
+          
+            const sensorStartDate = new Date(firstMeasurement.date.utc);
+            const sensorEndDate = new Date(sensorStartDate);
+            sensorEndDate.setFullYear(sensorEndDate.getFullYear() + 1);
+          
+            const today = new Date();
+            if (sensorEndDate > today) sensorEndDate.setTime(today.getTime());
+          
+            let page = 1;
+            let hasMore = true;
+          
+            while (hasMore) {
+              const measRes = await axios.get(BASE_MEASUREMENTS, {
+                params: {
+                  sensorId: sensor.id,
+                  date_from: sensorStartDate.toISOString(),
+                  date_to: sensorEndDate.toISOString(),
+                  limit: 100,
+                  page,
+                  sort: "desc",
+                },
+                headers: { "X-API-Key": OPENAQ_API_KEY },
+              });
+            
+              const measurements = measRes.data.results || [];
+            
+              if (!measurements.length) {
+                hasMore = false;
+                break;
+              }
+            
+              const param = sensor.parameter?.name?.toUpperCase();
+              const unit = sensor.parameter?.units || "";
+            
+              measurements.forEach((m) => {
+                if (param && m.value !== undefined) {
+                  if (!pollutants[param]) pollutants[param] = [];
+                
+                  if (param === "TEMPERATURE" || param === "RELATIVEHUMIDITY") {
+                    pollutants[param].push({
+                      value: Number(m.value),
+                      unit,
+                      date: m.date?.utc,
+                    });
+                  } else {
+                    const ugValue = toUgPerM3(m.value, unit, param);
+                    if (ugValue !== null) {
+                      pollutants[param].push({
+                        value: Number(ugValue.toFixed(2)),
+                        unit: "µg/m³",
+                        date: m.date?.utc,
+                      });
+                    }
+                  }
+                }
+              });
+            
+              hasMore = measurements.length === 100;
+              page++;
+            
+              await new Promise((resolve) => setTimeout(resolve, 200)); // small delay to avoid API rate limits
+            }
+          } catch (err) {
+            console.error(`Error fetching sensor ${sensor.id}:`, err.response?.status || err.message);
+          }
+        }
+      
+        allData.push({
+          location: loc.name,
+          coordinates: loc.coordinates,
+          pollutants,
+        });
+      })
+    );
+
+    // Step 3: Fill missing pollutant keys
+    const allParameters = new Set();
+    allData.forEach((loc) => {
+      Object.keys(loc.pollutants).forEach((param) => allParameters.add(param));
+    });
+    allData.forEach((loc) => {
+      allParameters.forEach((param) => {
+        if (!(param in loc.pollutants)) {
+          loc.pollutants[param] = [];
+        }
+      });
+    });
+    
+
+    // Step 4: Write to CSV
+    await writeDataToCSV(allData);
+
+    return res
+      .status(200)
+      .json(new ApiResponse(200, allData, "Fetched 1-year air quality data successfully"));
+  } catch (err) {
+    console.error("OpenAQ error:", err);
+    throw new ApiError(500, "Failed to fetch 1-year measurements from OpenAQ.");
+  }
+});
+
+export { createAirQualityData };

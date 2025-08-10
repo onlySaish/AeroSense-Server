@@ -2,6 +2,7 @@ import {ApiError} from "../utils/ApiError.js";
 import {asyncHandler} from "../utils/asyncHandler.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import axios from "axios";
+import { writeDataToCSV } from "../utils/csvWriter.js";
 
 const OPENAQ_API_KEY = process.env.OPENAQ_API_KEY;
 const BASE_LOCATIONS = 'https://api.openaq.org/v3/locations';
@@ -32,6 +33,9 @@ const getAirQuality = asyncHandler(async (req, res) => {
       );
     }
 
+    console.log(locations);
+    
+
     // Step 2: Get measurements for each location
     const allData = [];
 
@@ -60,7 +64,7 @@ const getAirQuality = asyncHandler(async (req, res) => {
                 sensorInfo = sensorRes.data?.results?.[0]; 
                 sensorCache.set(sensorId, sensorInfo);
               } catch (err) {
-                console.warn(`Failed to fetch sensor ${sensorId}`);
+                // console.warn(`Failed to fetch sensor ${sensorId}`);
                 return;
               }
             }
@@ -68,9 +72,14 @@ const getAirQuality = asyncHandler(async (req, res) => {
             const param = sensorInfo?.parameter?.name?.toUpperCase();
             const unit = sensorInfo?.parameter?.units || m.unit || "";
 
-            if (param && m.value !== undefined) {
-              const roundedValue = Number(m.value).toFixed(2); 
-              pollutants[param] = `${roundedValue} ${unit}`;
+            // Skip temperature and relative humidity
+            if (param === "TEMPERATURE" || param === "RELATIVEHUMIDITY") {
+              pollutants[param] = `${m.value} ${unit}`;
+            } else if (param && m.value !== undefined) {
+              const ugValue = toUgPerM3(m.value, unit, param);
+              if (ugValue !== null) {
+                pollutants[param] = `${ugValue.toFixed(2)} µg/m³`;
+              }
             }
           })
         );
@@ -79,6 +88,7 @@ const getAirQuality = asyncHandler(async (req, res) => {
           location: loc.name,
           coordinates: loc.coordinates,
           pollutants,
+          datetimeLast: loc.datetimeLast?.local
         });
       })
     );
@@ -97,6 +107,14 @@ const getAirQuality = asyncHandler(async (req, res) => {
       });
     });
 
+    // Write to CSV
+    if (allData.length === 0) {
+      return res.status(200).json(
+        new ApiResponse(200, [], "No measurements found for nearby locations")
+      );
+    }
+    await writeDataToCSV(allData);
+
     return res.status(200).json(
       new ApiResponse(200, allData, "Fetched air quality data successfully")
     );
@@ -105,5 +123,25 @@ const getAirQuality = asyncHandler(async (req, res) => {
     throw new ApiError(500, "Failed to fetch measurements from OpenAQ.");
   }
 });
+
+// Standardize pollutant values to µg/m³
+const MW = { // Molecular weights (g/mol)
+  'CO': 28.01,
+  'NO2': 46.01,
+  'O3': 48.00,
+  'SO2': 64.07,
+  'PM2.5': 1, // Already in µg/m³
+  'PM10': 1,  // Already in µg/m³
+};
+
+function toUgPerM3(value, unit, param) {
+  if (value === undefined || value === null || !unit || !param) return null;
+  param = param.toUpperCase();
+  if (unit === 'µg/m³' || unit === 'ug/m3') return Number(value);
+  if (unit === 'mg/m³' || unit === 'mg/m3') return Number(value) * 1000;
+  if (unit === 'ppm' && MW[param]) return Number(value) * MW[param] * 40.9;
+  if (unit === 'ppb' && MW[param]) return Number(value) * MW[param] * 0.0409;
+  return null; 
+}
 
 export { getAirQuality };
